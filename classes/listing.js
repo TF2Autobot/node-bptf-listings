@@ -60,6 +60,7 @@ class Listing {
         this.steamid = new SteamID(listing.steamid);
         this.intent = v2 ? (listing.intent === 'buy' ? 0 : 1) : listing.intent;
         this.item = listing.item;
+        this.sku = SKU.fromObject(this.getItem());
 
         this.details = listing.details;
         this.currencies = new Currencies(listing.currencies);
@@ -75,6 +76,9 @@ class Listing {
 
         this.v2 = v2;
         this._manager = manager;
+
+        this.item = undefined;
+
     }
 
     /**
@@ -85,12 +89,6 @@ class Listing {
         if (this.appid !== 440) {
             return null;
         }
-
-        if (this.sku !== undefined) {
-            return this.sku;
-        }
-
-        this.sku = SKU.fromObject(this.getItem());
 
         return this.sku;
     }
