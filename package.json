@@ -19,7 +19,7 @@
   },
   "homepage": "https://github.com/TF2Autobot/node-bptf-listings#readme",
   "dependencies": {
-    "@tf2autobot/filter-axios-error": "^1.5.4",
+    "@tf2autobot/filter-axios-error": "^1.5.5",
     "@tf2autobot/tf2-currencies": "^2.0.1",
     "@tf2autobot/tf2-sku": "^2.0.4",
     "async": "^3.2.6",
