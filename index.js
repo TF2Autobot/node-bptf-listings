@@ -23,15 +23,9 @@ async function axios(options) {
                 err.response['Retry-After'] ??
                 (s ? parseInt(s[0].replace('in ', '').replace(' second', '')) + 1 : null);
             const sleepRateLimited = err.response.data?.retry_after || sleepTime * 1000 || 10000;
-            let more;
-            if (err.response.data) {
-                try {
-                    more = JSON.stringify(err.response.data);
-                } catch {
-                    more = err.response.data;
-                }
-            }
-            console.warn(`Rate limited for ${sleepTime} seconds for ${options.url}.${more ? ` ${more}` : ''}`);
+
+            console.warn(`Rate limited for ${sleepTime} seconds for ${options.url}.`);
+            console.warn(`Waiting ${sleepRateLimited/1000} s before retrying...`);
             await new Promise(r => setTimeout(() => r(), sleepRateLimited));
             return axios(options);
         }
