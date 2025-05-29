@@ -11,26 +11,54 @@ const Listing = require('./classes/listing');
 
 const EFailiureReason = require('./resources/EFailureReason');
 
+const attempts = {};
+
+let isRateLimited = false;
+
 async function axios(options) {
+    if (isRateLimited) {
+        throw 'Rate limited, pausing sending requests to backpack.tf.';
+    }
+
+    const attemptType = `${options.method}_${options.url}`;
+    if (attempts[attemptType] === undefined) {
+        attempts[attemptType] = 0;
+    }
+    attempts[attemptType]++;
+
+    await new Promise(r => setTimeout(() => r(), 1000)); // add 1 second delay on every request
     try {
         return await _axios(options);
     } catch (err) {
         if (err?.response?.status === 429) {
             // Too many request error
+            if (attempts[attemptType] < 3) {
+                // Only two attempts
+                const s = err.response.data?.message?.match(/in \d+ second/);
+                const sleepTime =
+                    err.response['Retry-After'] ??
+                    (s ? parseInt(s[0].replace('in ', '').replace(' second', '')) + 1 : null);
+                const sleepRateLimited = err.response.data?.retry_after || (sleepTime ?? 61) * exponentialBackoff(attempts[attemptType]);
 
-            const s = err.response.data?.message?.match(/in \d+ second/);
-            const sleepTime =
-                err.response['Retry-After'] ??
-                (s ? parseInt(s[0].replace('in ', '').replace(' second', '')) + 1 : null);
-            const sleepRateLimited = err.response.data?.retry_after || sleepTime * 1000 || 10000;
+                isRateLimited = true;
+                console.warn(`Rate limited for ${sleepTime} seconds for ${options.url}.`);
+                console.warn(`Waiting ${sleepRateLimited / 1000} s before retrying...`);
+                await new Promise(r => setTimeout(() => {
+                    r();
+                    isRateLimited = false;
+                }, sleepRateLimited));
 
-            console.warn(`Rate limited for ${sleepTime} seconds for ${options.url}.`);
-            console.warn(`Waiting ${sleepRateLimited/1000} s before retrying...`);
-            await new Promise(r => setTimeout(() => r(), sleepRateLimited));
-            return axios(options);
+                return axios(options);
+            }
+            
         }
+        delete attempts[attemptType];
         throw err;
     }
+}
+
+function exponentialBackoff(n, base = 1000) {
+    return Math.pow(2, n) * base + Math.floor(Math.random() * base);
 }
 
 class ListingManager {
@@ -94,9 +122,9 @@ class ListingManager {
 
     setRequestOptions(method, url, body) {
         const options = {
+            baseURL: 'https://api.backpack.tf/api',
             url: url,
             method,
-            baseURL: 'https://api.backpack.tf/api',
             headers: {
                 'User-Agent': this.userAgent ? this.userAgent : 'User Agent',
                 Cookie: 'user-id=' + this.userID
@@ -177,6 +205,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`POST_/agent/pulse`];
+                isRateLimited = false;
 
                 this.emit('pulse', {
                     status: body.status,
@@ -210,6 +240,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`POST_/agent/stop`];
+                isRateLimited = false;
 
                 this.emit('pulse', { status: body.status });
 
@@ -236,6 +268,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`GET_/v2/classifieds/listings/batch`];
+                isRateLimited = false;
 
                 this.batchSize = body.opLimit;
 
@@ -260,6 +294,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`POST_/inventory/${this.steamid.getSteamID64()}/refresh`];
+                isRateLimited = false;
 
                 if (response.status >= 400) {
                     return callback(new Error(response.status + ' (' + response.statusText + ')'));
@@ -310,6 +346,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`GET_/classifieds/listings/v1`];
+                isRateLimited = false;
 
                 this.cap = body.cap;
                 this.promotes = body.promotes_remaining;
@@ -736,13 +774,13 @@ class ListingManager {
                     (err, result) => {
                         // TODO: Only get listings if we created or deleted listings
 
-                        if (err?.response?.status === 429) {
+                        if (err?.response?.status === 429 || err === 'Rate limited, pausing sending requests to backpack.tf.') {
                             // Too many request error
                             const s = err.response.data?.message?.match(/in \d+ second/);
                             const sleepTime = s
                                 ? (parseInt(s[0].replace('in ', '').replace(' second', '')) + 1) * 1000
                                 : null;
-                            this.sleepRateLimited = err.response.data?.retry_after || sleepTime || 10000;
+                            this.sleepRateLimited = err.response.data?.retry_after || sleepTime || 61 *1000;
                             this.isRateLimited = true;
 
                             this._processingActions = false;
@@ -805,6 +843,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`POST_/v2/classifieds/listings/batch`];
+                isRateLimited = false;
 
                 const waitForInventory = [];
                 const retryListings = [];
@@ -919,6 +959,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`PATCH_/v2/classifieds/listings/batch`];
+                isRateLimited = false;
 
                 this.emit('updateListingsSuccessful', { updated: body.updated?.length, errors: body.errors });
 
@@ -1014,6 +1056,8 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
+                delete attempts[`DELETE_/classifieds/delete/v1`];
+                isRateLimited = false;
 
                 this.emit('deleteListingsSuccessful', body);
 
@@ -1042,6 +1086,8 @@ class ListingManager {
                 // This return nothing (empty body)
 
                 if (response?.status === 200) {
+                    delete attempts[`DELETE_/v2/classifieds/archive/${listingId}`];
+                    isRateLimited = false;
                     this.emit('deleteArchivedListingSuccessful', true);
 
                     // Update cached listings
@@ -1105,6 +1151,8 @@ class ListingManager {
 
         axios(options)
             .then(response => {
+                delete attempts[`DELETE_/v2/classifieds/listings`];
+                isRateLimited = false;
                 const body1 = response.data;
 
                 this.emit('massDeleteListingsSuccessful', body1);
@@ -1117,6 +1165,8 @@ class ListingManager {
 
                 axios(options2)
                     .then(response2 => {
+                        delete attempts[`DELETE_/v2/classifieds/listings`];
+                        isRateLimited = false;
                         const body2 = response2.data;
 
                         this.emit('massDeleteArchiveSuccessful', body2);
@@ -1526,7 +1576,8 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
 
     const options = {
         method: 'GET',
-        url: 'https://api.backpack.tf/api/v2/classifieds/archive',
+        url: '/v2/classifieds/archive',
+        baseURL: 'https://api.backpack.tf/api',
         headers,
         params: {
             token,
@@ -1538,6 +1589,8 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
     setTimeout(() => {
         axios(options)
             .then(response => {
+                delete attempts[`GET_/v2/classifieds/archive`];
+                isRateLimited = false;
                 const body = response.data;
                 archivedListings = (archivedListings || []).concat(body.results.filter(raw => raw.appid == 440));
                 const total = body.cursor.total;
@@ -1551,14 +1604,6 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
                 }
             })
             .catch(err => {
-                if (err.response?.status === 429) {
-                    // Too many request error
-                    setTimeout(() => {
-                        getAllArchivedListings(skip, headers, token, archivedListings, callback);
-                    }, err.response.data?.retry_after || 10000); // retry again after 10 seconds
-                    return;
-                }
-
                 return callback(err);
             });
     }, 2000);
