@@ -11,6 +11,11 @@ const Listing = require('./classes/listing');
 
 const EFailiureReason = require('./resources/EFailureReason');
 
+// TODO: UPGRADE TO TYPESCRIPT
+// TODO: BETTER REQUEST/RATE-LIMIT HANDLING (WITH QUEUE)
+// TODO: UPGRADE EVERYTHING TO V2
+// THINGS THAT STILL USE V1: /classifieds/listings/v1 AND /classifieds/delete/v1
+
 const attempts = {};
 
 let isRateLimited = false;
