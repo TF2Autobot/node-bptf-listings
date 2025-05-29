@@ -1,6 +1,6 @@
 {
   "name": "@tf2autobot/bptf-listings",
-  "version": "5.7.9",
+  "version": "5.7.10",
   "description": "Manage listings on backpack.tf, originally made by Nicklason, modified by IdiNium.",
   "main": "index.js",
   "scripts": {
