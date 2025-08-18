@@ -117,8 +117,11 @@ class ListingManager {
         // Set default to 6 seconds:
         // V2 api batch is rate limited to 10 req/minute.
         this.waitTime = options.waitTime || 6000;
+        this.postPatchWaitTime = 21 * 1000
+        this.deleteWaitTime = 121 * 1000;
+        this.deleteV2WaitTime = 21 * 1000;
         // Amount of listings to create at once
-        this.batchSize = options.batchSize || 30;
+        this.batchSize = options.batchSize || 100;
 
         this.cap = null;
         this.promotes = null;
@@ -794,6 +797,13 @@ class ListingManager {
 
         this._processingActions = true;
 
+        const activeOrUnknownIds = this.actions.remove.filter(id => {
+            const match = this.listings.find(l => l.id === id);
+            return !match || match.archived !== true;
+        });
+        
+        const waitTime = activeOrUnknownIds.length > 0 ? this.deleteWaitTime : (this.actions.remove.length > 0 ? this.deleteV2WaitTime : this.postPatchWaitTime);
+
         setTimeout(
             () => {
                 const tasks = [];
@@ -873,7 +883,7 @@ class ListingManager {
                     }
                 );
             },
-            this.isRateLimited ? this.sleepRateLimited + this.waitTime : this.waitTime
+            this.isRateLimited ? this.sleepRateLimited + waitTime : waitTime
         );
 
         if (this.isRateLimited) {
@@ -1103,8 +1113,8 @@ class ListingManager {
         }
 
         const remove =
-            this.actions.remove.length > this.batchSize
-                ? this.actions.remove.slice(0, this.batchSize)
+            this.actions.remove.length > 100
+                ? this.actions.remove.slice(0, 100)
                 : this.actions.remove;
 
         if (remove.length === 0) {
@@ -1122,7 +1132,7 @@ class ListingManager {
 
         const requests = [];
 
-        const maxArchivedBatch = this.archivedBatchSize || 30;
+        const maxArchivedBatch = this.archivedBatchSize || 100;
         const archivedBatch = archivedIds.slice(0, maxArchivedBatch);
 
         const activeBatch = activeOrUnknownIds;
