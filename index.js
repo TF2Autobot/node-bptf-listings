@@ -18,11 +18,26 @@ const EFailiureReason = require('./resources/EFailureReason');
 
 const attempts = {};
 
-let isRateLimited = false;
+// Track rate-limit windows per endpoint path to avoid globally blocking unrelated API calls
+// Keyed by options.url that we pass to axios (e.g. '/v2/classifieds/listings/batch')
+const rateLimitUntilByPath = {};
 
 async function axios(options) {
-    if (isRateLimited) {
-        throw 'Rate limited, pausing sending requests to backpack.tf.';
+    // If this specific path is currently rate-limited, short-circuit to allow the caller
+    // to back off without blocking other endpoints.
+    const limiterKey = options.url;
+    if (rateLimitUntilByPath[limiterKey] && Date.now() < rateLimitUntilByPath[limiterKey]) {
+        const remainingMs = Math.max(0, rateLimitUntilByPath[limiterKey] - Date.now());
+        const err = new Error('Rate limited, pausing sending requests to backpack.tf.');
+        // Mimic minimal AxiosError shape so downstream handlers can process uniformly
+        err.response = {
+            status: 429,
+            data: {
+                message: `Rate limited, try again in ${Math.max(1, Math.round(remainingMs / 1000))} second`,
+                retry_after_ms: remainingMs
+            }
+        };
+        throw err;
     }
 
     const attemptType = `${options.method}_${options.url}`;
@@ -31,27 +46,37 @@ async function axios(options) {
     }
     attempts[attemptType]++;
 
-    await new Promise(r => setTimeout(() => r(), 1000)); // add 1 second delay on every request
+    await new Promise(r => setTimeout(() => r(), 1000));
     try {
-        return await _axios(options);
+        const res = await _axios(options);
+        delete attempts[attemptType];
+        return res;
     } catch (err) {
         if (err?.response?.status === 429) {
             // Too many request error
             if (attempts[attemptType] < 3) {
-                // Only two attempts
-                const s = err.response.data?.message?.match(/in \d+ second/);
-                const sleepTime =
-                    err.response['Retry-After'] ??
-                    (s ? parseInt(s[0].replace('in ', '').replace(' second', '')) + 1 : null);
-                const sleepRateLimited = err.response.data?.retry_after || (sleepTime ?? 61) * exponentialBackoff(attempts[attemptType]);
+                // Retry a couple of times obeying server-provided retry-after semantics
+                const headerRetryAfterSec = Number(err.response?.headers?.['retry-after']);
+                const match = err.response?.data?.message?.match(/in (\d+) second/);
+                const parsedMsgSec = match ? parseInt(match[1], 10) + 1 : NaN;
 
-                isRateLimited = true;
-                console.warn(`Rate limited for ${sleepTime} seconds for ${options.url}.`);
-                console.warn(`Waiting ${sleepRateLimited / 1000} s before retrying...`);
-                await new Promise(r => setTimeout(() => {
-                    r();
-                    isRateLimited = false;
-                }, sleepRateLimited));
+                // retry_after in API may arrive as milliseconds or seconds depending on endpoint
+                const dataRetryAfter = err.response?.data?.retry_after;
+                const dataRetryAfterMs = err.response?.data?.retry_after_ms;
+
+                let sleepMs = 0;
+                if (Number.isFinite(dataRetryAfterMs)) sleepMs = dataRetryAfterMs;
+                else if (Number.isFinite(dataRetryAfter)) sleepMs = dataRetryAfter * 1000;
+                else if (Number.isFinite(headerRetryAfterSec)) sleepMs = headerRetryAfterSec * 1000;
+                else if (Number.isFinite(parsedMsgSec)) sleepMs = parsedMsgSec * 1000;
+                else sleepMs = 61 * 1000; // conservative default
+
+                // Record per-path rate-limit window
+                rateLimitUntilByPath[limiterKey] = Date.now() + sleepMs;
+
+                console.warn(`Rate limited for ${Math.round(sleepMs / 1000)} seconds for ${options.url}.`);
+                console.warn(`Waiting ${Math.round(sleepMs / 1000)} s before retrying...`);
+                await new Promise(r => setTimeout(r, sleepMs));
 
                 return axios(options);
             }
@@ -92,6 +117,9 @@ class ListingManager {
         // Set default to 6 seconds:
         // V2 api batch is rate limited to 10 req/minute.
         this.waitTime = options.waitTime || 6000;
+        this.postPatchWaitTime = 21 * 1000
+        this.deleteWaitTime = 121 * 1000;
+        this.deleteV2WaitTime = 21 * 1000;
         // Amount of listings to create at once
         this.batchSize = options.batchSize || 100;
 
@@ -119,6 +147,14 @@ class ListingManager {
             remove: {},
             update: {}
         };
+
+        this._batchOpNext = 'update';
+
+        this.archivedBatchSize = options.archivedBatchSize || 30;
+
+        this.maxCreateRetry = options.maxCreateRetry || 3;
+        // Default = 2 hours to for slow inventory refreshes
+        this.waitForInventoryTimeoutMs = options.waitForInventoryTimeoutMs || 2 * 60 * 60 * 1000;
     }
 
     setUserID(userID) {
@@ -140,7 +176,11 @@ class ListingManager {
         };
 
         if (body) {
-            options['data'] = body;
+            if (method === 'GET') {
+                options.params = Object.assign({}, options.params, body);
+            } else {
+                options['data'] = body;
+            }
         }
 
         return options;
@@ -182,10 +222,8 @@ class ListingManager {
                     this.ready = true;
                     this.emit('ready');
 
-                    // Emit listings after initializing
                     this.emit('listings', this.listings);
 
-                    // Start processing actions if there are any
                     this._processActions();
 
                     return callback(null);
@@ -210,8 +248,6 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`POST_/agent/pulse`];
-                isRateLimited = false;
 
                 this.emit('pulse', {
                     status: body.status,
@@ -245,8 +281,6 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`POST_/agent/stop`];
-                isRateLimited = false;
 
                 this.emit('pulse', { status: body.status });
 
@@ -270,17 +304,31 @@ class ListingManager {
         }
 
         const options = this.setRequestOptions('GET', '/v2/classifieds/listings/batch');
+        const optionsArchive = this.setRequestOptions('GET', '/v2/classifieds/archive/batch');
+
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`GET_/v2/classifieds/listings/batch`];
-                isRateLimited = false;
-
-                this.batchSize = body.opLimit;
-
-                this.emit('batchLimit', body.opLimit);
-
-                return callback(null, body);
+                if (Number.isFinite(body?.opLimit)) {
+                    this.batchSize = body.opLimit;
+                    this.emit('batchLimit', body.opLimit);
+                }
+                return axios(optionsArchive)
+                    .then(response2 => {
+                        const body2 = response2.data;
+                        if (Number.isFinite(body2?.opLimit)) {
+                            this.archivedBatchSize = body2.opLimit;
+                            this.emit('archiveBatchLimit', body2.opLimit);
+                        }
+                        return callback(null, { listings: body, archive: body2 });
+                    })
+                    .catch(err2 => {
+                        // If archive/batch is not available (404) or bad request, keep default archivedBatchSize
+                        if (err2?.response?.status === 404 || err2?.response?.status === 400) {
+                            return callback(null, { listings: body, archive: null });
+                        }
+                        return callback(err2);
+                    });
             })
             .catch(err => {
                 if (err) {
@@ -299,8 +347,6 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`POST_/inventory/${this.steamid.getSteamID64()}/refresh`];
-                isRateLimited = false;
 
                 if (response.status >= 400) {
                     return callback(new Error(response.status + ' (' + response.statusText + ')'));
@@ -311,12 +357,10 @@ class ListingManager {
                 if (this._lastInventoryUpdate === null) {
                     this._lastInventoryUpdate = time;
                 } else if (time !== this._lastInventoryUpdate) {
-                    // The inventory has updated on backpack.tf
                     this._lastInventoryUpdate = time;
 
                     this.emit('inventory', this._lastInventoryUpdate);
 
-                    // The inventory has been updated on backpack.tf, try and make listings
                     this._processActions();
                 }
 
@@ -351,12 +395,10 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`GET_/classifieds/listings/v1`];
-                isRateLimited = false;
 
                 this.cap = body.cap;
                 this.promotes = body.promotes_remaining;
-                this.listings = body.listings.filter(raw => raw.appid == 440).map(raw => new Listing(raw, this, false));
+                this.listings = body.listings.filter(raw => raw.appid === 440).map(raw => new Listing(raw, this, false));
 
                 const populate = () => {
                     // Populate map
@@ -388,7 +430,6 @@ class ListingManager {
                 };
 
                 if (onShutdown) {
-                    // Don't need to get archived listings on shutdown
                     return populate();
                 }
 
@@ -560,10 +601,6 @@ class ListingManager {
             });
         }
 
-        if (listing.archived) {
-            this._deleteArchived(listing.id);
-        }
-
         // We will also call this no matter what because sometimes the listings that were archived
         // earlier become active when there's enough pure, but in memory, it's still "archived",
         // so it is not being removed.
@@ -607,7 +644,6 @@ class ListingManager {
                 doneSomething = true;
             }
         } else if (type === 'update') {
-            // Might need to add something later
             this.actions[type] = this.actions[type].concat(array);
             doneSomething = true;
         }
@@ -623,7 +659,6 @@ class ListingManager {
         const identifier = formatted.intent == 0 ? formatted.sku : formatted.id;
 
         if (this._actions.create[identifier] === undefined || this._actions.create[identifier].time < formatted.time) {
-            // First time we see the item, it is new
             this._actions.create[identifier] = formatted;
         }
     }
@@ -635,7 +670,6 @@ class ListingManager {
             return false;
         }
 
-        // Returns true if listing in map is older
         return this._actions.create[identifier].time < formatted.time;
     }
 
@@ -651,7 +685,6 @@ class ListingManager {
             return true;
         }
 
-        // Listing is not the newest
         return false;
     }
 
@@ -690,7 +723,6 @@ class ListingManager {
      * Stops all timers and timeouts and clear values to default
      */
     shutdown() {
-        // Stop timers
         clearTimeout(this._timeout);
         clearInterval(this._updateListingsInterval);
         clearInterval(this._userAgentInterval);
@@ -699,14 +731,14 @@ class ListingManager {
         clearInterval(this._checkArchivedListingsFailedToDeleteInterval);
 
         this.stopUserAgent(() => {
-            // Reset values
             this.ready = false;
             this.listings = [];
             this.cap = null;
             this.promotes = null;
             this.actions = { create: [], remove: [], update: [] };
             this._actions = { create: {}, remove: {}, update: {} };
-            this._checkArchivedListingsFailedToDeleteInterval = {};
+            this.deleteArchivedFailedAttempt = {};
+            this._checkArchivedListingsFailedToDeleteInterval = null;
             this._lastInventoryUpdate = null;
             this._createdListingsCount = 0;
         });
@@ -760,32 +792,72 @@ class ListingManager {
             return;
         }
 
+        // Remove stale create entries to avoid being stuck forever
+        this._pruneStaleCreateQueue();
+
         this._processingActions = true;
+
+        const activeOrUnknownIds = this.actions.remove.filter(id => {
+            const match = this.listings.find(l => l.id === id);
+            return !match || match.archived !== true;
+        });
+        
+        const waitTime = activeOrUnknownIds.length > 0 ? this.deleteWaitTime : (this.actions.remove.length > 0 ? this.deleteV2WaitTime : this.postPatchWaitTime);
 
         setTimeout(
             () => {
-                async.series(
-                    {
-                        update: callback => {
-                            this._update(callback);
-                        },
-                        delete: callback => {
-                            this._delete(callback);
-                        },
-                        create: callback => {
-                            this._create(callback);
+                const tasks = [];
+
+                // Always try to process deletions first
+                if (this.actions.remove.length > 0) {
+                    tasks.push(callback => this._delete(callback));
+                }
+
+                const haveUpdate = this.actions.update.length > 0;
+                const haveCreate = this.actions.create.some(l => !this._isCreateWaiting(l));
+
+                if (haveUpdate || haveCreate) {
+                    if (this._batchOpNext === 'update') {
+                        if (haveUpdate) {
+                            tasks.push(callback => this._update(callback));
+                            this._batchOpNext = 'create';
+                        } else if (haveCreate) {
+                            tasks.push(callback => this._create(callback));
+                            // Keep next desired op as 'update' for fairness
+                            this._batchOpNext = 'update';
                         }
-                    },
+                    } else {
+                        if (haveCreate) {
+                            tasks.push(callback => this._create(callback));
+                            this._batchOpNext = 'update';
+                        } else if (haveUpdate) {
+                            tasks.push(callback => this._update(callback));
+                            this._batchOpNext = 'create';
+                        }
+                    }
+                }
+
+                if (tasks.length === 0) {
+                    this._processingActions = false;
+                    return callback(null);
+                }
+
+                async.series(
+                    tasks,
                     (err, result) => {
                         // TODO: Only get listings if we created or deleted listings
 
-                        if (err?.response?.status === 429 || err === 'Rate limited, pausing sending requests to backpack.tf.') {
-                            // Too many request error
-                            const s = err.response.data?.message?.match(/in \d+ second/);
-                            const sleepTime = s
-                                ? (parseInt(s[0].replace('in ', '').replace(' second', '')) + 1) * 1000
-                                : null;
-                            this.sleepRateLimited = err.response.data?.retry_after || sleepTime || 61 *1000;
+                        if (err?.response?.status === 429) {
+                            // Too many request error or pre-check short-circuit
+                            const message = err.response?.data?.message || '';
+                            const match = message.match(/in (\d+) second/);
+                            const parsedMsgMs = match ? (parseInt(match[1], 10) + 1) * 1000 : null;
+                            const retryAfterMs = Number.isFinite(err.response?.data?.retry_after_ms)
+                                ? err.response.data.retry_after_ms
+                                : (Number.isFinite(err.response?.data?.retry_after)
+                                    ? err.response.data.retry_after * 1000
+                                    : null);
+                            this.sleepRateLimited = retryAfterMs ?? parsedMsgMs ?? 61 * 1000;
                             this.isRateLimited = true;
 
                             this._processingActions = false;
@@ -800,11 +872,9 @@ class ListingManager {
                             this._listingsWaitingForRetry() - this.actions.create.length !== 0
                         ) {
                             this._processingActions = false;
-                            // There are still things to do
                             this._processActions();
                             callback(null);
                         } else {
-                            // Queues are empty, get listings
                             this.getListings(false, () => {
                                 this._processingActions = false;
                                 callback(null);
@@ -813,7 +883,7 @@ class ListingManager {
                     }
                 );
             },
-            this.isRateLimited ? this.sleepRateLimited + this.waitTime : this.waitTime
+            this.isRateLimited ? this.sleepRateLimited + waitTime : waitTime
         );
 
         if (this.isRateLimited) {
@@ -835,7 +905,7 @@ class ListingManager {
         // TODO: Don't send sku and attempt time to backpack.tf
 
         const batch = this.actions.create
-            .filter(listing => listing.attempt !== this._lastInventoryUpdate)
+            .filter(listing => !this._isCreateWaiting(listing))
             .slice(0, this.batchSize);
 
         if (batch.length === 0) {
@@ -848,8 +918,6 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`POST_/v2/classifieds/listings/batch`];
-                isRateLimited = false;
 
                 const waitForInventory = [];
                 const retryListings = [];
@@ -878,7 +946,6 @@ class ListingManager {
                             } else if (element.error.message.includes('as it already exists')) {
                                 // This error should be extremely rare
 
-                                // Find listing matching the identifier in create queue
                                 const match = this.actions.create.find(formatted =>
                                     this._isSameByIdentifier(formatted, formatted.intent, identifier)
                                 );
@@ -904,6 +971,9 @@ class ListingManager {
                     if (formatted.intent === 1 && waitForInventory.includes(formatted.id)) {
                         // We should wait for the inventory to update
                         formatted.attempt = this._lastInventoryUpdate;
+                        if (formatted.waitSince === undefined) {
+                            formatted.waitSince = Date.now();
+                        }
                         return true;
                     }
 
@@ -913,6 +983,7 @@ class ListingManager {
                     ) {
                         // A similar listing was already made, we will need to remove the old listing and then try and add this one again
                         formatted.retry = true;
+                        formatted.retryCount = (formatted.retryCount || 0) + 1;
                         return true;
                     }
 
@@ -964,8 +1035,6 @@ class ListingManager {
         axios(options)
             .then(response => {
                 const body = response.data;
-                delete attempts[`PATCH_/v2/classifieds/listings/batch`];
-                isRateLimited = false;
 
                 this.emit('updateListingsSuccessful', { updated: body.updated?.length, errors: body.errors });
 
@@ -1044,8 +1113,8 @@ class ListingManager {
         }
 
         const remove =
-            this.actions.remove.length > this.batchSize
-                ? this.actions.remove.slice(0, this.batchSize)
+            this.actions.remove.length > 100
+                ? this.actions.remove.slice(0, 100)
                 : this.actions.remove;
 
         if (remove.length === 0) {
@@ -1053,28 +1122,76 @@ class ListingManager {
             return;
         }
 
-        //keep using old api, as it does not seem to have any item limit
-        const options = this.setRequestOptions('DELETE', '/classifieds/delete/v1', {
-            listing_ids: remove
-        });
+        const archivedIds = [];
+        const activeOrUnknownIds = [];
+        for (const id of remove) {
+            const match = this.listings.find(l => l.id === id);
+            if (match && match.archived === true) archivedIds.push(id);
+            else activeOrUnknownIds.push(id);
+        }
 
-        axios(options)
-            .then(response => {
-                const body = response.data;
-                delete attempts[`DELETE_/classifieds/delete/v1`];
-                isRateLimited = false;
+        const requests = [];
 
-                this.emit('deleteListingsSuccessful', body);
+        const maxArchivedBatch = this.archivedBatchSize || 100;
+        const archivedBatch = archivedIds.slice(0, maxArchivedBatch);
 
-                // Filter out listings that we just deleted
-                this.actions.remove = this.actions.remove.filter(id => remove.indexOf(id) === -1);
+        const activeBatch = activeOrUnknownIds;
 
-                // Update cached listings
-                this.listings = this.listings.filter(listing => remove.indexOf(listing.id) === -1);
+        if (activeBatch.length > 0) {
+            const optActive = this.setRequestOptions('DELETE', '/classifieds/delete/v1', {
+                listing_ids: activeBatch
+            });
+            requests.push(
+                axios(optActive).then(response => {
+                    const body = response.data;
+                    this.emit('deleteListingsSuccessful', body);
+                    return { kind: 'active', body };
+                })
+            );
+        }
+
+        const handleArchivedBatchDelete = async ids => {
+            if (ids.length === 0) return { kind: 'archived', body: null };
+            try {
+                const optArchivedBatch = this.setRequestOptions('DELETE', '/v2/classifieds/archive/batch', {
+                    listing_ids: ids
+                });
+                const resp = await axios(optArchivedBatch);
+                return { kind: 'archived', body: resp.data ?? true };
+            } catch (e) {
+                const results = [];
+                for (const id of ids) {
+                    const opt = this.setRequestOptions('DELETE', `/v2/classifieds/archive/${id}`);
+                    try {
+                        const r = await axios(opt);
+                        results.push(true);
+                        this.emit('deleteArchivedListingSuccessful', true);
+                    } catch (err) {
+                        this.emit('deleteArchivedListingError', filterAxiosError(err));
+                    }
+                }
+                return { kind: 'archived', body: results };
+            }
+        };
+
+        requests.push(handleArchivedBatchDelete(archivedBatch));
+
+        Promise.all(requests)
+            .then(results => {
+                const processedIds = new Set([...activeBatch, ...archivedBatch]);
+
+                this.actions.remove = this.actions.remove.filter(id => !processedIds.has(id));
+
+                this.listings = this.listings.filter(listing => !processedIds.has(listing.id));
 
                 this.emit('actions', this.actions);
 
-                return callback(null, body);
+                const summary = {
+                    active: results.find(r => r.kind === 'active')?.body ?? null,
+                    archived: results.find(r => r.kind === 'archived')?.body ?? null
+                };
+
+                return callback(null, summary);
             })
             .catch(err => {
                 this.emit('deleteListingsError', filterAxiosError(err));
@@ -1088,44 +1205,29 @@ class ListingManager {
 
         axios(options)
             .then(response => {
-                // This return nothing (empty body)
-
                 if (response?.status === 200) {
-                    delete attempts[`DELETE_/v2/classifieds/archive/${listingId}`];
-                    isRateLimited = false;
                     this.emit('deleteArchivedListingSuccessful', true);
-
-                    // Update cached listings
-                    this.listings = this.listings.filter(listing => listing.id === listingId);
+                    this.listings = this.listings.filter(listing => listing.id !== listingId);
                 }
             })
             .catch(err => {
-                if (err.response?.status === 200) {
-                    // Got error, but status is 200 (OK), consider success.
-                    this.emit('deleteArchivedListingSuccessful', true);
-
-                    // Update cached listings
-                    this.listings = this.listings.filter(listing => listing.id === listingId);
-                } else {
-                    if (err.response?.status !== 404) {
-                        // We only retry if status is not 404 (Not Found)
-                        if (this.deleteArchivedFailedAttempt[listingId] === undefined) {
-                            this.deleteArchivedFailedAttempt[listingId] = 1;
-                        } else {
-                            this.deleteArchivedFailedAttempt[listingId] = this.deleteArchivedFailedAttempt[listingId]++;
-                        }
-
-                        this.checkDeleteArchivedFailedAttempt(listingId);
-
-                        this.emit('deleteArchivedListingError', filterAxiosError(err));
+                if (err.response?.status !== 404) {
+                    if (this.deleteArchivedFailedAttempt[listingId] === undefined) {
+                        this.deleteArchivedFailedAttempt[listingId] = 1;
                     } else {
-                        if (this.deleteArchivedFailedAttempt[listingId] !== undefined) {
-                            delete this.deleteArchivedFailedAttempt[listingId];
-                        }
-
-                        // Listing not found, update cached listings
-                        this.listings = this.listings.filter(listing => listing.id === listingId);
+                        this.deleteArchivedFailedAttempt[listingId] += 1;
                     }
+
+                    this.checkDeleteArchivedFailedAttempt(listingId);
+
+                    this.emit('deleteArchivedListingError', filterAxiosError(err));
+                } else {
+                    if (this.deleteArchivedFailedAttempt[listingId] !== undefined) {
+                        delete this.deleteArchivedFailedAttempt[listingId];
+                    }
+
+                    // Listing not found, ensure it's not kept in memory
+                    this.listings = this.listings.filter(listing => listing.id !== listingId);
                 }
             });
     }
@@ -1135,7 +1237,7 @@ class ListingManager {
             // if more than 1 times failed to delete a listing that is archived in
             // memory, then remove it (the listing might not exist, or changed to active state)
 
-            this.listings = this.listings.filter(listing => listing.id === listingId);
+            this.listings = this.listings.filter(listing => listing.id !== listingId);
             delete this.deleteArchivedFailedAttempt[listingId];
         }
     }
@@ -1148,30 +1250,19 @@ class ListingManager {
     deleteAllListings(intent, callback) {
         if (typeof intent === 'function' && !callback) callback = intent;
 
-        const options = this.setRequestOptions('DELETE', `/v2/classifieds/listings`);
-
-        if ([0, 1].includes(intent)) {
-            options.body['intent'] = intent;
-        }
+        const body1 = [0, 1].includes(intent) ? { intent } : undefined;
+        const options = this.setRequestOptions('DELETE', `/v2/classifieds/listings`, body1);
 
         axios(options)
             .then(response => {
-                delete attempts[`DELETE_/v2/classifieds/listings`];
-                isRateLimited = false;
                 const body1 = response.data;
-
                 this.emit('massDeleteListingsSuccessful', body1);
 
-                const options2 = this.setRequestOptions('DELETE', `/v2/classifieds/archive`);
-
-                if ([0, 1].includes(intent)) {
-                    options2.body['intent'] = intent;
-                }
+                const body2 = [0, 1].includes(intent) ? { intent } : undefined;
+                const options2 = this.setRequestOptions('DELETE', `/v2/classifieds/archive`, body2);
 
                 axios(options2)
                     .then(response2 => {
-                        delete attempts[`DELETE_/v2/classifieds/listings`];
-                        isRateLimited = false;
                         const body2 = response2.data;
 
                         this.emit('massDeleteArchiveSuccessful', body2);
@@ -1216,7 +1307,6 @@ class ListingManager {
             if (listing.promoted !== undefined) {
                 delete listing.promoted;
             }
-            // Keep sku for later
         } else {
             if (listing.id === undefined) {
                 return null;
@@ -1286,8 +1376,6 @@ class ListingManager {
         if (schemaItem === null) {
             return null;
         }
-
-        // Begin formatting "item"
 
         const formatItem = {
             defindex: item.defindex,
@@ -1545,6 +1633,33 @@ class ListingManager {
     _listingsWaitingForRetry() {
         return this.actions.create.filter(listing => listing.retry !== undefined).length;
     }
+
+    _isCreateWaiting(listing) {
+        if (listing.intent !== 1) return false;
+        return listing.attempt === this._lastInventoryUpdate;
+    }
+
+    _pruneStaleCreateQueue() {
+        const now = Date.now();
+        this.actions.create = this.actions.create.filter(listing => {
+            // Drop if retry exceeded
+            if (listing.retry === true && (listing.retryCount || 0) > this.maxCreateRetry) {
+                return false;
+            }
+
+            // Drop if waiting for inventory for too long
+            if (this._isCreateWaiting(listing)) {
+                const since = listing.waitSince || now;
+                listing.waitSince = since;
+                if (now - since > this.waitForInventoryTimeoutMs) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+        this.emit('actions', this.actions);
+    }
 }
 
 inherits(ListingManager, EventEmitter);
@@ -1594,16 +1709,17 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
     setTimeout(() => {
         axios(options)
             .then(response => {
-                delete attempts[`GET_/v2/classifieds/archive`];
-                isRateLimited = false;
                 const body = response.data;
-                archivedListings = (archivedListings || []).concat(body.results.filter(raw => raw.appid == 440));
-                const total = body.cursor.total;
-                const diff = total - body.cursor.skip;
+                archivedListings = (archivedListings || []).concat(body.results.filter(raw => raw.appid === 440));
 
-                if (diff > 0) {
-                    skip = skip + 100;
-                    getAllArchivedListings(skip, headers, token, archivedListings, callback);
+                const cursor = body.cursor || {};
+                const total = Number(cursor.total) || 0;
+                const currentSkip = Number(cursor.skip) || 0;
+                const limit = Number(cursor.limit) || 0;
+                const nextSkip = currentSkip + limit;
+
+                if (nextSkip < total && limit > 0) {
+                    getAllArchivedListings(nextSkip, headers, token, archivedListings, callback);
                 } else {
                     callback(null, archivedListings);
                 }
