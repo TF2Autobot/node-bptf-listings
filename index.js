@@ -181,7 +181,7 @@ class ListingManager {
 
         if (PROXY_CONFIG.enabled) {
             const proxyUrl = `http://${PROXY_CONFIG.username}:${PROXY_CONFIG.password}@${PROXY_CONFIG.host}:${PROXY_CONFIG.port}`;
-            this.httpsAgent = new HttpsProxyAgent(proxyUrl);
+            this.httpsAgent = new HttpsProxyAgent(proxyUrl, { keepAlive: false });
             this.proxy = false;
         } else {
             this.httpsAgent = null;
