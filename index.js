@@ -123,7 +123,8 @@ class ListingManager {
         // Amount of listings to create at once
         this.batchSize = options.batchSize || 100;
 
-        this.cap = null;
+        this._listingsCap = null;
+        this._listingsLimitsLastFetched = 0;
         this.promotes = null;
 
         this.listings = [];
@@ -396,7 +397,8 @@ class ListingManager {
             .then(response => {
                 const body = response.data;
 
-                this.cap = body.cap;
+                this._listingsCap = body.cap;
+                this._listingsLimitsLastFetched = Date.now();
                 this.promotes = body.promotes_remaining;
                 this.listings = body.listings.filter(raw => raw.appid === 440).map(raw => new Listing(raw, this, false));
 
@@ -607,6 +609,40 @@ class ListingManager {
         this._action('remove', listing.id);
     }
 
+    _fetchListingsLimits(callback) {
+        console.debug('request!')
+        this._listingsLimitsLastFetched = Date.now(); // To make no additional requests, even if an error happens
+
+        const options = this.setRequestOptions('GET', '/classifieds/limits');
+        axios(options)
+            .then(response => {
+                const body = response.data;
+                this._listingsCap = body.listings.total;
+            })
+            .catch(err => {
+                if (err) {
+                    return callback(err);
+                }
+            });
+    }
+
+    get cap() {
+        // Unsure about the exact API limits, so the time period is subject to change
+        if (Date.now() - this._listingsLimitsLastFetched > 15 * 1000) {
+            this._fetchListingsLimits(async (err) => {
+                if (err) {
+                    console.log('Error while fetching listings limits:', err);
+                }
+            });
+        }
+        return this._listingsCap;
+    }
+
+    set cap(value) {
+        // For some simple backward compatibility
+        this._listingsCap = value;
+    }
+
     /**
      * Function used to enqueue jobs
      * @param {String} type
@@ -733,7 +769,8 @@ class ListingManager {
         this.stopUserAgent(() => {
             this.ready = false;
             this.listings = [];
-            this.cap = null;
+            this._listingsCap = null;
+            this._listingsLimitsLastFetched = Infinity; // I hope that's correct in JS
             this.promotes = null;
             this.actions = { create: [], remove: [], update: [] };
             this._actions = { create: {}, remove: {}, update: {} };
