@@ -1,0 +1,12 @@
+{
+  "proxy": {
+    "enabled": false,
+    "host": "proxy.example.com",
+    "port": 12323,
+    "username": "your_username",
+    "password": "your_password"
+  },
+  "debug": {
+    "enabled": false
+  }
+}

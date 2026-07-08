@@ -3,6 +3,9 @@ const SteamID = require('steamid');
 const _axios = require('axios').default;
 const SKU = require('@tf2autobot/tf2-sku');
 const filterAxiosError = require('@tf2autobot/filter-axios-error');
+const fs = require('fs');
+const path = require('path');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const inherits = require('util').inherits;
 const EventEmitter = require('events').EventEmitter;
@@ -10,6 +13,57 @@ const EventEmitter = require('events').EventEmitter;
 const Listing = require('./classes/listing');
 
 const EFailiureReason = require('./resources/EFailureReason');
+
+let config = {};
+try {
+    config = require('./config.json');
+} catch (err) {
+    config = { debug: { enabled: false }, proxy: { enabled: false } };
+}
+
+const DEBUG_ENABLED = config.debug?.enabled || false;
+const PROXY_CONFIG = config.proxy || {};
+
+let DEBUG_LOG_FILE = null;
+
+function initDebug() {
+    if (!DEBUG_ENABLED) return;
+
+    DEBUG_LOG_FILE = path.join(__dirname, 'bptf-listings-debug.log');
+
+    // Log startup message
+    const timestamp = new Date().toISOString();
+    const startupMsg = `\n${'='.repeat(80)}\n[${timestamp}] DEBUG LOGGING ENABLED\nLog file: ${DEBUG_LOG_FILE}\nNode version: ${process.version}\nPlatform: ${process.platform}\n${'='.repeat(80)}\n`;
+
+    try {
+        fs.appendFileSync(DEBUG_LOG_FILE, startupMsg);
+        console.log(`[BPTF-LISTINGS] Debug logging enabled: ${DEBUG_LOG_FILE}`);
+    } catch (err) {
+        console.error(`[BPTF-LISTINGS] Failed to initialize debug log: ${err.message}`);
+    }
+}
+
+// Initialize debug on module load if enabled
+if (DEBUG_ENABLED) {
+    initDebug();
+}
+
+function debugLog(message, data = null) {
+    if (!DEBUG_ENABLED) return;
+
+    const timestamp = new Date().toISOString();
+    let logLine = `[${timestamp}] ${message}`;
+    if (data !== null && data !== undefined) {
+        logLine += '\n' + JSON.stringify(data, null, 2);
+    }
+    logLine += '\n';
+
+    try {
+        fs.appendFileSync(DEBUG_LOG_FILE, logLine);
+    } catch (err) {
+        console.error(`[BPTF-LISTINGS] Debug log write failed: ${err.message}`);
+    }
+}
 
 // TODO: UPGRADE TO TYPESCRIPT
 // TODO: BETTER REQUEST/RATE-LIMIT HANDLING (WITH QUEUE)
@@ -117,11 +171,22 @@ class ListingManager {
         // Set default to 6 seconds:
         // V2 api batch is rate limited to 10 req/minute.
         this.waitTime = options.waitTime || 6000;
-        this.postPatchWaitTime = 21 * 1000
-        this.deleteWaitTime = 121 * 1000;
-        this.deleteV2WaitTime = 21 * 1000;
-        // Amount of listings to create at once
+        this.postPatchWaitTime = 6 * 1000;
+        this.deleteWaitTime = 60 * 1000;
+        this.deleteV2WaitTime = 6 * 1000;
         this.batchSize = options.batchSize || 100;
+
+        this.maxCreateRetry = options.maxCreateRetry || 3;
+        this.maxUpdateRetry = options.maxUpdateRetry || 2;
+
+        if (PROXY_CONFIG.enabled) {
+            const proxyUrl = `http://${PROXY_CONFIG.username}:${PROXY_CONFIG.password}@${PROXY_CONFIG.host}:${PROXY_CONFIG.port}`;
+            this.httpsAgent = new HttpsProxyAgent(proxyUrl, { keepAlive: false });
+            this.proxy = false;
+        } else {
+            this.httpsAgent = null;
+            this.proxy = null;
+        }
 
         this.cap = null;
         this.promotes = null;
@@ -181,6 +246,14 @@ class ListingManager {
             } else {
                 options['data'] = body;
             }
+        }
+
+        if (this.proxy) {
+            options.proxy = this.proxy;
+        }
+
+        if (this.httpsAgent) {
+            options.httpsAgent = this.httpsAgent;
         }
 
         return options;
@@ -245,9 +318,24 @@ class ListingManager {
 
         const options = this.setRequestOptions('POST', '/agent/pulse');
 
+        debugLog('=== /agent/pulse REQUEST ===', {
+            url: options.baseURL + options.url,
+            method: options.method,
+            headers: options.headers,
+            params: options.params,
+            proxy: options.proxy,
+            httpsAgent: options.httpsAgent ? 'HttpsProxyAgent configured' : null
+        });
+
         axios(options)
             .then(response => {
                 const body = response.data;
+
+                debugLog('=== /agent/pulse SUCCESS ===', {
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: body
+                });
 
                 this.emit('pulse', {
                     status: body.status,
@@ -259,6 +347,15 @@ class ListingManager {
                 return callback(null, body);
             })
             .catch(err => {
+                debugLog('=== /agent/pulse ERROR ===', {
+                    message: err.message,
+                    code: err.code,
+                    status: err.response?.status,
+                    statusText: err.response?.statusText,
+                    data: err.response?.data,
+                    headers: err.response?.headers
+                });
+
                 if (err) {
                     return callback(err);
                 }
@@ -536,7 +633,15 @@ class ListingManager {
             throw new Error('Module has not been successfully initialized');
         }
 
+        debugLog('updateListing() called', {
+            listingId: listing.id,
+            archived: listing.archived,
+            properties: properties,
+            currentQueueSize: this.actions.update.length
+        });
+
         if (listing.archived) {
+            debugLog(`Listing ${listing.id} is archived - converting to CREATE operation`);
             // if archived, we recreate it.
             const toRecreate = Object.assign(
                 {},
@@ -644,8 +749,45 @@ class ListingManager {
                 doneSomething = true;
             }
         } else if (type === 'update') {
-            this.actions[type] = this.actions[type].concat(array);
-            doneSomething = true;
+            debugLog(`_action('update') processing ${array.length} update(s)`, {
+                queueSizeBefore: this.actions.update.length,
+                updates: array.map(u => ({ id: u.id, body: u.body }))
+            });
+
+            // Deduplicate updates - merge properties for same listing ID
+            array.forEach(update => {
+                const existingIndex = this.actions.update.findIndex(u => u.id === update.id);
+                if (existingIndex !== -1) {
+                    debugLog(`Merging duplicate update for listing ${update.id}`);
+                    // Merge properties into existing update and update timestamp
+                    Object.assign(this.actions.update[existingIndex].body, update.body);
+                    this.actions.update[existingIndex].timestamp = Date.now();
+                } else {
+                    debugLog(`Adding new update to queue for listing ${update.id}`);
+                    // Add new update to queue with timestamp
+                    update.timestamp = Date.now();
+                    this.actions.update.push(update);
+                    doneSomething = true;
+                }
+            });
+            // Track in _actions map for consistency
+            array.forEach(update => {
+                if (!this._actions.update[update.id]) {
+                    update.timestamp = update.timestamp || Date.now();
+                    this._actions.update[update.id] = update;
+                } else {
+                    // Merge properties and update timestamp
+                    Object.assign(this._actions.update[update.id].body, update.body);
+                    this._actions.update[update.id].timestamp = Date.now();
+                }
+            });
+
+            debugLog(`Update queue after processing`, {
+                queueSizeAfter: this.actions.update.length
+            });
+            if (array.length > 0 && this.actions.update.length > 0) {
+                doneSomething = true;
+            }
         }
 
         if (doneSomething) {
@@ -792,8 +934,14 @@ class ListingManager {
             return;
         }
 
-        // Remove stale create entries to avoid being stuck forever
         this._pruneStaleCreateQueue();
+        this._pruneStaleUpdateQueue();
+
+        debugLog('_processActions() called', {
+            updateQueue: this.actions.update.length,
+            createQueue: this.actions.create.length,
+            removeQueue: this.actions.remove.length
+        });
 
         this._processingActions = true;
 
@@ -801,7 +949,6 @@ class ListingManager {
             const match = this.listings.find(l => l.id === id);
             return !match || match.archived !== true;
         });
-        
         const waitTime = activeOrUnknownIds.length > 0 ? this.deleteWaitTime : (this.actions.remove.length > 0 ? this.deleteV2WaitTime : this.postPatchWaitTime);
 
         setTimeout(
@@ -816,24 +963,38 @@ class ListingManager {
                 const haveUpdate = this.actions.update.length > 0;
                 const haveCreate = this.actions.create.some(l => !this._isCreateWaiting(l));
 
+                // Smart prioritization: prioritize updates when queue is large
+                const updateQueueSize = this.actions.update.length;
+                const createQueueSize = this.actions.create.filter(l => !this._isCreateWaiting(l)).length;
+
                 if (haveUpdate || haveCreate) {
-                    if (this._batchOpNext === 'update') {
-                        if (haveUpdate) {
-                            tasks.push(callback => this._update(callback));
-                            this._batchOpNext = 'create';
-                        } else if (haveCreate) {
-                            tasks.push(callback => this._create(callback));
-                            // Keep next desired op as 'update' for fairness
-                            this._batchOpNext = 'update';
-                        }
-                    } else {
-                        if (haveCreate) {
-                            tasks.push(callback => this._create(callback));
-                            this._batchOpNext = 'update';
-                        } else if (haveUpdate) {
-                            tasks.push(callback => this._update(callback));
-                            this._batchOpNext = 'create';
-                        }
+                    // Prioritize updates if:
+                    // 1. Update queue is large (>200 items), OR
+                    // 2. No creates available, OR
+                    // 3. Update queue is significantly larger than create queue (3x ratio)
+                    const shouldPrioritizeUpdates =
+                        (updateQueueSize > 200) ||
+                        (!haveCreate) ||
+                        (updateQueueSize > createQueueSize * 3);
+
+                    debugLog('Determining operation priority', {
+                        updateQueueSize,
+                        createQueueSize,
+                        shouldPrioritizeUpdates,
+                        reason: updateQueueSize > 200 ? 'queue>200' : (!haveCreate ? 'no creates' : (updateQueueSize > createQueueSize * 3 ? '3x ratio' : 'normal alternation'))
+                    });
+
+                    if (shouldPrioritizeUpdates && haveUpdate) {
+                        debugLog('Processing UPDATES (prioritized)');
+                        tasks.push(callback => this._update(callback));
+                        this._batchOpNext = 'create'; // Next time try creates for fairness
+                    } else if (haveCreate) {
+                        debugLog('Processing CREATES');
+                        tasks.push(callback => this._create(callback));
+                        this._batchOpNext = 'update'; // Next time try updates for fairness
+                    } else if (haveUpdate) {
+                        tasks.push(callback => this._update(callback));
+                        this._batchOpNext = 'create';
                     }
                 }
 
@@ -1015,6 +1176,11 @@ class ListingManager {
      * @param {Function} callback
      */
     _update(callback) {
+        debugLog('_update() called', {
+            queueSize: this.actions.update.length,
+            batchSize: this.batchSize
+        });
+
         if (this.actions.update.length === 0) {
             callback(null, null);
             return;
@@ -1030,11 +1196,21 @@ class ListingManager {
             return;
         }
 
+        debugLog(`Sending PATCH request for ${update.length} update(s)`, {
+            batch: update.map(u => ({ id: u.id, body: u.body }))
+        });
+
         const options = this.setRequestOptions('PATCH', '/v2/classifieds/listings/batch', update);
 
         axios(options)
             .then(response => {
                 const body = response.data;
+
+                debugLog('PATCH response received', {
+                    statusCode: response.status,
+                    updatedCount: body.updated?.length,
+                    errorsCount: body.errors?.length
+                });
 
                 this.emit('updateListingsSuccessful', { updated: body.updated?.length, errors: body.errors });
 
@@ -1071,12 +1247,43 @@ class ListingManager {
                     });
                 }
 
+                // Track which listing IDs were successfully updated
+                const successfulIds = new Set();
+                const notFoundIds = new Set();
+
+                // Add IDs that were updated (not in errors)
+                if (Array.isArray(body.updated)) {
+                    // V2 API returns array of objects with 'id' property, not just IDs
+                    body.updated.forEach(item => {
+                        const listingId = typeof item === 'string' ? item : item.id;
+                        successfulIds.add(listingId);
+                    });
+                    debugLog(`Successfully updated ${body.updated.length} listing(s)`, {
+                        successfulIds: Array.from(successfulIds)
+                    });
+                }
+
+                // Track "Item not found" errors - these will be recreated and should be removed from update queue
+                if (Array.isArray(body.errors)) {
+                    body.errors.forEach(error => {
+                        if (error.id && error.message === 'Item not found') {
+                            notFoundIds.add(error.id);
+                            debugLog(`Item not found error for listing ${error.id} - will recreate`);
+                        }
+                    });
+                }
+
                 update.forEach(el => {
+                    // Only update local state if the API confirmed success
+                    if (!successfulIds.has(el.id)) {
+                        return; // Skip this one, will remain in queue
+                    }
+
                     const index = this.listings.findIndex(listing => listing.id === el.id);
                     if (index >= 0) {
                         for (const key in el.body) {
-                            if (!Object.prototype.hasOwnProperty.call(this.listings[index], key)) return;
-                            if (!Object.prototype.hasOwnProperty.call(el.body, key)) return;
+                            if (!Object.prototype.hasOwnProperty.call(this.listings[index], key)) continue;
+                            if (!Object.prototype.hasOwnProperty.call(el.body, key)) continue;
                             this.listings[index][key] = el.body[key];
                         }
                         this._listings[
@@ -1085,8 +1292,57 @@ class ListingManager {
                                 : this.listings[index].item.id
                         ] = this.listings[index];
                     }
+                });
 
-                    this.actions.update.shift();
+                // Remove successful updates and track retry count for failures
+                debugLog('Processing queue removal/retry logic', {
+                    batchSize: update.length,
+                    queueSizeBefore: this.actions.update.length
+                });
+
+                this.actions.update = this.actions.update.filter((item, index) => {
+                    if (index >= update.length) return true; // Keep items not in this batch
+
+                    const batchItem = update[index];
+                    const wasSuccessful = successfulIds.has(batchItem.id);
+                    const wasNotFound = notFoundIds.has(batchItem.id);
+
+                    // Remove if successful
+                    if (wasSuccessful) {
+                        debugLog(`Removing successful update from queue: ${batchItem.id}`);
+                        delete this._actions.update[batchItem.id];
+                        return false;
+                    }
+
+                    // Remove if "Item not found" (already recreated in create queue)
+                    if (wasNotFound) {
+                        debugLog(`Removing "Item not found" update from queue: ${batchItem.id}`);
+                        delete this._actions.update[batchItem.id];
+                        return false;
+                    }
+
+                    // Failed - increment retry count
+                    if (!item.retryCount) {
+                        item.retryCount = 1;
+                    } else {
+                        item.retryCount++;
+                    }
+
+                    debugLog(`Update failed for ${item.id} - retry count: ${item.retryCount}`);
+
+                    // Drop if exceeded max retries (default 2 for updates, lower than creates)
+                    const maxRetries = this.maxUpdateRetry || 2;
+                    if (item.retryCount > maxRetries) {
+                        debugLog(`DROPPING update for ${item.id} after ${item.retryCount} retries (max: ${maxRetries})`);
+                        delete this._actions.update[item.id];
+                        return false; // Drop from queue
+                    }
+
+                    return true; // Keep for retry
+                });
+
+                debugLog('Queue processing complete', {
+                    queueSizeAfter: this.actions.update.length
                 });
 
                 this.emit('actions', this.actions);
@@ -1095,6 +1351,11 @@ class ListingManager {
             })
             .catch(err => {
                 if (err) {
+                    debugLog('ERROR: PATCH request failed', {
+                        error: err.message,
+                        status: err.response?.status,
+                        data: err.response?.data
+                    });
                     this.emit('updateListingsError', filterAxiosError(err));
                     // Might need to do something if failed, like if item id not found.
                     return callback(err);
@@ -1637,6 +1898,20 @@ class ListingManager {
     _isCreateWaiting(listing) {
         if (listing.intent !== 1) return false;
         return listing.attempt === this._lastInventoryUpdate;
+    }
+
+    _pruneStaleUpdateQueue() {
+        const now = Date.now();
+        const maxAge = 30 * 60 * 1000;
+
+        this.actions.update = this.actions.update.filter(item => {
+            if (item.timestamp && now - item.timestamp > maxAge) {
+                delete this._actions.update[item.id];
+                return false;
+            }
+            return true;
+        });
+        this.emit('actions', this.actions);
     }
 
     _pruneStaleCreateQueue() {
