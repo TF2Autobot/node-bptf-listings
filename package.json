@@ -19,14 +19,15 @@
   },
   "homepage": "https://github.com/TF2Autobot/node-bptf-listings#readme",
   "dependencies": {
-    "@tf2autobot/filter-axios-error": "^1.5.6",
     "@tf2autobot/tf2-currencies": "^2.0.1",
     "@tf2autobot/tf2-sku": "^2.0.4",
     "async": "^3.2.6",
-    "axios": "^1.18.1",
     "events": "^3.3.0",
     "https-proxy-agent": "^7.0.6",
     "steamid": "^2.1.0",
     "util": "^0.12.5"
-  }
+  },
+	"engines": {
+		"node": ">=22.x"
+	}
 }

@@ -1,17 +1,12 @@
 const async = require('async');
 const SteamID = require('steamid');
-const _axios = require('axios').default;
 const SKU = require('@tf2autobot/tf2-sku');
-const filterAxiosError = require('@tf2autobot/filter-axios-error');
 const fs = require('fs');
 const path = require('path');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-
 const inherits = require('util').inherits;
 const EventEmitter = require('events').EventEmitter;
-
 const Listing = require('./classes/listing');
-
 const EFailiureReason = require('./resources/EFailureReason');
 
 let config = {};
@@ -73,17 +68,17 @@ function debugLog(message, data = null) {
 const attempts = {};
 
 // Track rate-limit windows per endpoint path to avoid globally blocking unrelated API calls
-// Keyed by options.url that we pass to axios (e.g. '/v2/classifieds/listings/batch')
+// Keyed by options.url that we pass to customFetch (e.g. '/v2/classifieds/listings/batch')
 const rateLimitUntilByPath = {};
 
-async function axios(options) {
+async function customFetch(options) {
     // If this specific path is currently rate-limited, short-circuit to allow the caller
     // to back off without blocking other endpoints.
     const limiterKey = options.url;
     if (rateLimitUntilByPath[limiterKey] && Date.now() < rateLimitUntilByPath[limiterKey]) {
         const remainingMs = Math.max(0, rateLimitUntilByPath[limiterKey] - Date.now());
         const err = new Error('Rate limited, pausing sending requests to backpack.tf.');
-        // Mimic minimal AxiosError shape so downstream handlers can process uniformly
+        // Mimic minimal error shape so downstream handlers can process uniformly
         err.response = {
             status: 429,
             data: {
@@ -102,7 +97,67 @@ async function axios(options) {
 
     await new Promise(r => setTimeout(() => r(), 1000));
     try {
-        const res = await _axios(options);
+        const fullUrl = (options.baseURL || '') + options.url;
+        const urlObj = new URL(fullUrl);
+
+        if (options.params) {
+            for (const [key, value] of Object.entries(options.params)) {
+                if (value !== undefined && value !== null) {
+                    urlObj.searchParams.append(key, value);
+                }
+            }
+        }
+
+        const fetchOptions = {
+            method: options.method || 'GET',
+            headers: { ...options.headers }
+        };
+
+        if (options.data) {
+            if (!fetchOptions.headers['Content-Type']) {
+                fetchOptions.headers['Content-Type'] = 'application/json';
+            }
+            fetchOptions.body = typeof options.data === 'string' ? options.data : JSON.stringify(options.data);
+        }
+
+        if (options.httpsAgent) {
+            // Include both dispatcher (for undici/native fetch) and agent (for node-fetch fallback)
+            fetchOptions.agent = options.httpsAgent;
+            fetchOptions.dispatcher = options.httpsAgent;
+        }
+
+        const fetchRes = await fetch(urlObj.toString(), fetchOptions);
+        const contentType = fetchRes.headers.get('content-type');
+        
+        let responseData;
+        const textData = await fetchRes.text();
+        
+        if (contentType && contentType.includes('application/json')) {
+            try {
+                responseData = JSON.parse(textData);
+            } catch (e) {
+                responseData = textData;
+            }
+        } else {
+            responseData = textData;
+        }
+
+        const res = {
+            status: fetchRes.status,
+            statusText: fetchRes.statusText,
+            headers: Object.fromEntries(fetchRes.headers.entries()),
+            data: responseData,
+            config: options
+        };
+
+        if (!fetchRes.ok) {
+            const error = new Error(`Request failed with status code ${fetchRes.status}`);
+            error.config = options;
+            error.response = res;
+            error.status = fetchRes.status;
+            throw error;
+        }
+
         delete attempts[attemptType];
         return res;
     } catch (err) {
@@ -132,7 +187,7 @@ async function axios(options) {
                 console.warn(`Waiting ${Math.round(sleepMs / 1000)} s before retrying...`);
                 await new Promise(r => setTimeout(r, sleepMs));
 
-                return axios(options);
+                return customFetch(options);
             }
             
         }
@@ -327,7 +382,7 @@ class ListingManager {
             httpsAgent: options.httpsAgent ? 'HttpsProxyAgent configured' : null
         });
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -375,7 +430,7 @@ class ListingManager {
 
         const options = this.setRequestOptions('POST', '/agent/stop');
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -403,14 +458,14 @@ class ListingManager {
         const options = this.setRequestOptions('GET', '/v2/classifieds/listings/batch');
         const optionsArchive = this.setRequestOptions('GET', '/v2/classifieds/archive/batch');
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
                 if (Number.isFinite(body?.opLimit)) {
                     this.batchSize = body.opLimit;
                     this.emit('batchLimit', body.opLimit);
                 }
-                return axios(optionsArchive)
+                return customFetch(optionsArchive)
                     .then(response2 => {
                         const body2 = response2.data;
                         if (Number.isFinite(body2?.opLimit)) {
@@ -441,7 +496,7 @@ class ListingManager {
     _updateInventory(callback) {
         const options = this.setRequestOptions('POST', `/inventory/${this.steamid.getSteamID64()}/refresh`);
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -489,7 +544,7 @@ class ListingManager {
 
         this.isGettingListings = true;
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -1076,7 +1131,7 @@ class ListingManager {
 
         const options = this.setRequestOptions('POST', '/v2/classifieds/listings/batch', batch);
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -1165,7 +1220,7 @@ class ListingManager {
             })
             .catch(err => {
                 if (err) {
-                    this.emit('createListingsError', filterAxiosError(err));
+                    this.emit('createListingsError', err);
                     return callback(err);
                 }
             });
@@ -1202,7 +1257,7 @@ class ListingManager {
 
         const options = this.setRequestOptions('PATCH', '/v2/classifieds/listings/batch', update);
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
 
@@ -1356,7 +1411,7 @@ class ListingManager {
                         status: err.response?.status,
                         data: err.response?.data
                     });
-                    this.emit('updateListingsError', filterAxiosError(err));
+                    this.emit('updateListingsError', err);
                     // Might need to do something if failed, like if item id not found.
                     return callback(err);
                 }
@@ -1403,7 +1458,7 @@ class ListingManager {
                 listing_ids: activeBatch
             });
             requests.push(
-                axios(optActive).then(response => {
+                customFetch(optActive).then(response => {
                     const body = response.data;
                     this.emit('deleteListingsSuccessful', body);
                     return { kind: 'active', body };
@@ -1417,18 +1472,18 @@ class ListingManager {
                 const optArchivedBatch = this.setRequestOptions('DELETE', '/v2/classifieds/archive/batch', {
                     listing_ids: ids
                 });
-                const resp = await axios(optArchivedBatch);
+                const resp = await customFetch(optArchivedBatch);
                 return { kind: 'archived', body: resp.data ?? true };
             } catch (e) {
                 const results = [];
                 for (const id of ids) {
                     const opt = this.setRequestOptions('DELETE', `/v2/classifieds/archive/${id}`);
                     try {
-                        const r = await axios(opt);
+                        const r = await customFetch(opt);
                         results.push(true);
                         this.emit('deleteArchivedListingSuccessful', true);
                     } catch (err) {
-                        this.emit('deleteArchivedListingError', filterAxiosError(err));
+                        this.emit('deleteArchivedListingError', err);
                     }
                 }
                 return { kind: 'archived', body: results };
@@ -1455,7 +1510,7 @@ class ListingManager {
                 return callback(null, summary);
             })
             .catch(err => {
-                this.emit('deleteListingsError', filterAxiosError(err));
+                this.emit('deleteListingsError', err);
                 return callback(err);
             });
     }
@@ -1464,7 +1519,7 @@ class ListingManager {
         // Delete a single archived listing - Immediate
         const options = this.setRequestOptions('DELETE', `/v2/classifieds/archive/${listingId}`);
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 if (response?.status === 200) {
                     this.emit('deleteArchivedListingSuccessful', true);
@@ -1481,7 +1536,7 @@ class ListingManager {
 
                     this.checkDeleteArchivedFailedAttempt(listingId);
 
-                    this.emit('deleteArchivedListingError', filterAxiosError(err));
+                    this.emit('deleteArchivedListingError', err);
                 } else {
                     if (this.deleteArchivedFailedAttempt[listingId] !== undefined) {
                         delete this.deleteArchivedFailedAttempt[listingId];
@@ -1514,7 +1569,7 @@ class ListingManager {
         const body1 = [0, 1].includes(intent) ? { intent } : undefined;
         const options = this.setRequestOptions('DELETE', `/v2/classifieds/listings`, body1);
 
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body1 = response.data;
                 this.emit('massDeleteListingsSuccessful', body1);
@@ -1522,7 +1577,7 @@ class ListingManager {
                 const body2 = [0, 1].includes(intent) ? { intent } : undefined;
                 const options2 = this.setRequestOptions('DELETE', `/v2/classifieds/archive`, body2);
 
-                axios(options2)
+                customFetch(options2)
                     .then(response2 => {
                         const body2 = response2.data;
 
@@ -1532,13 +1587,13 @@ class ListingManager {
                     })
                     .catch(err => {
                         if (err) {
-                            this.emit('massDeleteArchiveError', filterAxiosError(err));
+                            this.emit('massDeleteArchiveError', err);
                             return callback(err);
                         }
                     });
             })
             .catch(err => {
-                this.emit('massDeleteListingsError', filterAxiosError(err));
+                this.emit('massDeleteListingsError', err);
                 return callback(err);
             });
     }
@@ -1982,7 +2037,7 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
     };
 
     setTimeout(() => {
-        axios(options)
+        customFetch(options)
             .then(response => {
                 const body = response.data;
                 archivedListings = (archivedListings || []).concat(body.results.filter(raw => raw.appid === 440));
