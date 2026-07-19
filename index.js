@@ -3,6 +3,7 @@ const SteamID = require('steamid');
 const SKU = require('@tf2autobot/tf2-sku');
 const fs = require('fs');
 const path = require('path');
+const { ProxyAgent } = require('undici'); // Added for native fetch support
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const inherits = require('util').inherits;
 const EventEmitter = require('events').EventEmitter;
@@ -120,10 +121,13 @@ async function customFetch(options) {
             fetchOptions.body = typeof options.data === 'string' ? options.data : JSON.stringify(options.data);
         }
 
+        if (options.dispatcher) {
+            // Include dispatcher for undici/native fetch
+            fetchOptions.dispatcher = options.dispatcher;
+        }
         if (options.httpsAgent) {
-            // Include both dispatcher (for undici/native fetch) and agent (for node-fetch fallback)
+            // Fallback agent if a legacy node-fetch polyfill is being used
             fetchOptions.agent = options.httpsAgent;
-            fetchOptions.dispatcher = options.httpsAgent;
         }
 
         const fetchRes = await fetch(urlObj.toString(), fetchOptions);
@@ -236,9 +240,13 @@ class ListingManager {
 
         if (PROXY_CONFIG.enabled) {
             const proxyUrl = `http://${PROXY_CONFIG.username}:${PROXY_CONFIG.password}@${PROXY_CONFIG.host}:${PROXY_CONFIG.port}`;
+            // Use undici's ProxyAgent for native fetch
+            this.dispatcher = new ProxyAgent({ uri: proxyUrl });
+            // Fallback for legacy requests
             this.httpsAgent = new HttpsProxyAgent(proxyUrl, { keepAlive: false });
             this.proxy = false;
         } else {
+            this.dispatcher = null;
             this.httpsAgent = null;
             this.proxy = null;
         }
@@ -305,6 +313,10 @@ class ListingManager {
 
         if (this.proxy) {
             options.proxy = this.proxy;
+        }
+
+        if (this.dispatcher) {
+            options.dispatcher = this.dispatcher;
         }
 
         if (this.httpsAgent) {
@@ -379,7 +391,7 @@ class ListingManager {
             headers: options.headers,
             params: options.params,
             proxy: options.proxy,
-            httpsAgent: options.httpsAgent ? 'HttpsProxyAgent configured' : null
+            dispatcher: options.dispatcher ? 'Undici ProxyAgent configured' : null
         });
 
         customFetch(options)
@@ -593,6 +605,8 @@ class ListingManager {
                     },
                     this.token,
                     [],
+                    this.dispatcher,
+                    this.httpsAgent,
                     (err, archivedListings) => {
                         if (err) {
                             this.isGettingListings = false;
@@ -2017,11 +2031,19 @@ function isObject(val) {
  * @param {Object} headers
  * @param {String} token
  * @param {Array} archivedListings
+ * @param {Object} dispatcher
+ * @param {Object} httpsAgent
  * @param {Function} callback
  */
-function getAllArchivedListings(skip, headers, token, archivedListings, callback) {
-    if (callback === undefined) {
+function getAllArchivedListings(skip, headers, token, archivedListings, dispatcher, httpsAgent, callback) {
+    // Graceful callback assignments just in case this function is called with fewer arguments manually somewhere
+    if (typeof archivedListings === 'function') {
         callback = archivedListings;
+        archivedListings = undefined;
+    } else if (typeof dispatcher === 'function') {
+        callback = dispatcher;
+        dispatcher = undefined;
+        httpsAgent = undefined;
     }
 
     const options = {
@@ -2033,7 +2055,9 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
             token,
             skip,
             limit: 1000
-        }
+        },
+        dispatcher,
+        httpsAgent
     };
 
     setTimeout(() => {
@@ -2049,7 +2073,7 @@ function getAllArchivedListings(skip, headers, token, archivedListings, callback
                 const nextSkip = currentSkip + limit;
 
                 if (nextSkip < total && limit > 0) {
-                    getAllArchivedListings(nextSkip, headers, token, archivedListings, callback);
+                    getAllArchivedListings(nextSkip, headers, token, archivedListings, dispatcher, httpsAgent, callback);
                 } else {
                     callback(null, archivedListings);
                 }
