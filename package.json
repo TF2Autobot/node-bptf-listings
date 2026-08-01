@@ -30,5 +30,11 @@
   },
   "engines": {
     "node": ">=22.x"
-  }
+  },
+  "files": [
+    "classes/",
+    "resources/",
+    "index.js",
+    "index.d.ts"
+  ]
 }
