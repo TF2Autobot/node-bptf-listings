@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import SchemaManager from '@tf2autobot/tf2-schema';
 import SteamID from 'steamid';
-import TF2Currencies from '@tf2autobot/tf2-currencies';
+import Currencies from '@tf2autobot/tf2-currencies';
 
 declare class ListingManager extends EventEmitter {
     static EFailiureReason: Record<string, unknown>;
@@ -69,7 +69,7 @@ declare class ListingManager extends EventEmitter {
 
     removeListing(listingId: string): void;
 
-    removeListings(...listings: (string|ListingManager.Listing)[]): void;
+    removeListings(...listings: (string | ListingManager.Listing)[]): void;
 
     deleteAllListings(callback: (err: any, body?: any) => any): void;
 
@@ -96,12 +96,19 @@ declare class ListingManager extends EventEmitter {
 
     on(
         event: 'createListingsSuccessful',
-        handler: (response: { created: number; archived: number; errors: { message: string }[] }) => void
+        handler: (response: {
+            created: number;
+            archived: number;
+            errors: ListingManager.ListingsSuccessfulError[];
+        }) => void
     ): this;
 
     on(event: 'updateListingsError', handler: (err: ListingManager.CustomError) => void): this;
 
-    on(event: 'updateListingsSuccessful', handler: (response: { updated: number; errors: [] }) => void): this;
+    on(
+        event: 'updateListingsSuccessful',
+        handler: (response: { updated: number; errors: ListingManager.ListingsSuccessfulError[] }) => void
+    ): this;
 
     on(event: 'deleteListingsError', handler: (err: ListingManager.CustomError) => void): this;
 
@@ -146,19 +153,40 @@ declare namespace ListingManager {
         quantity?: number;
         details?: string;
         promoted?: 0 | 1;
-        currencies: TF2Currencies;
+        currencies: Currencies;
         time: number;
     }
 
     interface UpdateListing {
         details: string;
-        currencies: TF2Currencies;
+        currencies: Currencies;
     }
 
     interface CustomError {
         message: string;
         status: number;
         data: Record<string, any>;
+    }
+
+    interface ListingsSuccessfulError {
+        listing: ListingData;
+        error: ListingError;
+    }
+
+    interface ListingData {
+        time: number;
+        id: number;
+        intent: number;
+        promoted: number;
+        details: string;
+        currencies: Currencies;
+        offers: number;
+        buyout: number;
+    }
+
+    interface ListingError {
+        message: string;
+        request: ListingData;
     }
 
     export class Listing {
@@ -176,7 +204,7 @@ declare namespace ListingManager {
 
         details: string;
 
-        currencies: TF2Currencies;
+        currencies: Currencies;
 
         offers: boolean;
 
@@ -199,7 +227,7 @@ declare namespace ListingManager {
         getItem(): Item;
 
         update(properties: {
-            currencies?: TF2Currencies;
+            currencies?: Currencies;
             details?: string;
             // quantity?: number;
         }): void;
