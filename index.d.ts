@@ -175,7 +175,7 @@ declare namespace ListingManager {
 
     interface ListingData {
         time: number;
-        id: number;
+        id: string;
         intent: number;
         promoted: number;
         details: string;
